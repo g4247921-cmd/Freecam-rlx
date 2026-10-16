@@ -1,0 +1,992 @@
+--[[
+	FreeCam LocalScript (Smooth + Zoom + Hide Gui + Cinematic Lighting Pro + Auto Scale PC/Mobile)
+	========================================================================================
+- 	Tombol toggle : Tombol kustom di Tengah Agak Bawah atau F2
+- 	Saat aktif    : Semua ScreenGui + CoreGui disembunyikan + Sembunyikan Overhead
+- 	Fitur Lighting: Brightness, Exposure, Blur, DoF, Bloom, SunRays, Atmosphere, ColorCorrection
+--]]
+
+-- ─── Services ────────────────────────────────────────────────────────────────
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local StarterGui        = game:GetService("StarterGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Lighting          = game:GetService("Lighting")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = workspace.CurrentCamera
+local Character   = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local HumanoidRP  = Character:WaitForChild("HumanoidRootPart")
+local Humanoid    = Character:WaitForChild("Humanoid")
+
+-- ─── Konfigurasi & State Lighting Asli ───────────────────────────────────────
+
+local CONFIG = {
+	Speed       = 40,
+	SprintSpeed = 120,
+	Sensitivity = 0.004,
+	MobileSpeed = 0.7,
+	TiltSpeed   = 1.2,
+	TiltMax     = 180,
+	Smoothness  = 0.15,
+	ZoomSpeed   = 5,
+	MinFOV      = 20,
+	MaxFOV      = 90,
+}
+
+-- Pilihan Skala Kontrol: "Auto", "Mobile", atau "PC"
+local SCALE_MODE = "Auto"
+
+local originalLighting = {
+	Brightness           = Lighting.Brightness,
+	ClockTime            = Lighting.ClockTime,
+	ExposureCompensation = Lighting.ExposureCompensation,
+	Ambient              = Lighting.Ambient,
+	OutdoorAmbient       = Lighting.OutdoorAmbient,
+	GeographicLatitude   = Lighting.GeographicLatitude,
+}
+
+-- Kontainer Efek Cinematic Pro
+local cinematicEffects = {
+	Bloom           = nil,
+	DepthOfField    = nil,
+	Blur            = nil,
+	ColorCorrection = nil,
+	SunRays         = nil,
+	Atmosphere      = nil,
+}
+
+-- Nilai Pengaturan Lighting (Default Cinematic)
+local currentLightingSettings = {
+	Brightness        = 2.5,
+	Exposure          = 0.2,
+	BlurSize          = 0,
+	DoFEnabled        = false,
+	FocusDistance     = 100,
+	BloomIntensity    = 0.8,
+	SunIntensity      = 0.3,
+	AtmosphereDensity = 0.25,
+	Saturation        = 0.15,
+	Contrast          = 0.2,
+}
+
+-- ─── State ───────────────────────────────────────────────────────────────────
+
+local FreeCamActive   = false
+local IsTransitioning = false
+local FreeCamPart     = nil
+local Connections     = {}
+local HiddenGuis      = {}
+local UIHidden        = false
+local MenuOpen        = false
+
+local OriginalRootAnchored  = false
+local OriginalRootCollision = true
+
+local RMBHeld       = false
+local pitch, yaw    = 0, 0
+local roll          = 0
+local currentFov    = 70
+local targetFov     = 70
+local currentVelocity = Vector3.new(0, 0, 0)
+
+local MobileLookId  = nil
+local MobileLastPos = nil
+
+local MobileInput = {
+	Forward   = false, Back  = false,
+	Left      = false, Right = false,
+	Up        = false, Down  = false,
+	TiltLeft  = false, TiltRight = false,
+	ZoomIn    = false, ZoomOut = false,
+}
+
+-- ─── Konfigurasi CoreGui ──────────────────────────────────────────────────────
+
+local CORE_HIDE = {
+	Chat        = true,
+	Health      = true,
+	PlayerList  = true,
+	EmotesMenu  = true,
+	Backpack    = true,
+}
+
+local function setCoreUI(visible)
+	for el, shouldHide in pairs(CORE_HIDE) do
+		if shouldHide then
+			pcall(function()
+				StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType[el], visible)
+			end)
+		end
+	end
+end
+
+-- ─── ScreenGui Hide / Restore ─────────────────────────────────────────────────
+
+local function hideAllScreenGuis()
+	local pg = LocalPlayer:WaitForChild("PlayerGui")
+	for _, obj in ipairs(pg:GetChildren()) do
+		if obj:IsA("ScreenGui") and obj.Name ~= "FreeCamOverlay" and obj.Enabled then
+			obj.Enabled = false
+			table.insert(HiddenGuis, obj)
+		end
+	end
+end
+
+local function restoreAllScreenGuis()
+	for _, obj in ipairs(HiddenGuis) do
+		if obj and obj.Parent then obj.Enabled = true end
+	end
+	HiddenGuis = {}
+end
+
+-- ─── Overhead / NameTag Hide ──────────────────────────────────────────────────
+
+local function setOverheadsVisible(visible)
+	for _, player in ipairs(Players:GetPlayers()) do
+		local char = player.Character
+		if char then
+			local function checkAndSet(descendant)
+				if descendant:IsA("BillboardGui") or descendant:IsA("SurfaceGui") then
+					if descendant.Name ~= "FreeCamOverlay" then
+						descendant.Enabled = visible
+					end
+				end
+			end
+			for _, descendant in ipairs(char:GetDescendants()) do
+				checkAndSet(descendant)
+			end
+			char.DescendantAdded:Connect(function(descendant)
+				if FreeCamActive then
+					checkAndSet(descendant)
+				end
+			end)
+		end
+	end
+end
+
+-- ─── Setup Efek Cinematic Lighting Pro ────────────────────────────────────────
+
+local function setupCinematicEffects()
+	originalLighting.Brightness = Lighting.Brightness
+	originalLighting.ExposureCompensation = Lighting.ExposureCompensation
+	originalLighting.ClockTime = Lighting.ClockTime
+
+	Lighting.ClockTime = 17.5 
+
+	local bloom = Instance.new("BloomEffect")
+	bloom.Name = "FreeCam_Bloom"
+	bloom.Intensity = currentLightingSettings.BloomIntensity
+	bloom.Size = 32
+	bloom.Threshold = 0.8
+	bloom.Parent = Lighting
+	cinematicEffects.Bloom = bloom
+
+	local dof = Instance.new("DepthOfFieldEffect")
+	dof.Name = "FreeCam_DoF"
+	dof.Enabled = currentLightingSettings.DoFEnabled
+	dof.FocusDistance = currentLightingSettings.FocusDistance
+	dof.InFocusRadius = 25
+	dof.NearIntensity = 0.7
+	dof.FarIntensity = 0.7
+	dof.Parent = Lighting
+	cinematicEffects.DepthOfField = dof
+
+	local blur = Instance.new("BlurEffect")
+	blur.Name = "FreeCam_Blur"
+	blur.Size = currentLightingSettings.BlurSize
+	blur.Parent = Lighting
+	cinematicEffects.Blur = blur
+
+	local cc = Instance.new("ColorCorrectionEffect")
+	cc.Name = "FreeCam_CC"
+	cc.Saturation = currentLightingSettings.Saturation
+	cc.Contrast = currentLightingSettings.Contrast
+	cc.TintColor = Color3.fromRGB(255, 245, 230)
+	cc.Parent = Lighting
+	cinematicEffects.ColorCorrection = cc
+
+	local sunRays = Instance.new("SunRaysEffect")
+	sunRays.Name = "FreeCam_SunRays"
+	sunRays.Intensity = currentLightingSettings.SunIntensity
+	sunRays.Spread = 0.5
+	sunRays.Parent = Lighting
+	cinematicEffects.SunRays = sunRays
+
+	local atmos = Instance.new("Atmosphere")
+	atmos.Name = "FreeCam_Atmosphere"
+	atmos.Density = currentLightingSettings.AtmosphereDensity
+	atmos.Offset = 0.25
+	atmos.Color = Color3.fromRGB(200, 210, 230)
+	atmos.Decay = Color3.fromRGB(80, 90, 110)
+	atmos.Glare = 0.4
+	atmos.Haze = 1.5
+	atmos.Parent = Lighting
+	cinematicEffects.Atmosphere = atmos
+end
+
+local function removeCinematicEffects()
+	Lighting.Brightness = originalLighting.Brightness
+	Lighting.ExposureCompensation = originalLighting.ExposureCompensation
+	Lighting.ClockTime = originalLighting.ClockTime
+
+	for _, eff in pairs(cinematicEffects) do
+		if eff and eff.Parent then
+			pcall(function() eff:Destroy() end)
+		end
+	end
+
+	for _, child in ipairs(Lighting:GetChildren()) do
+		if child.Name:sub(1, 8) == "FreeCam_" then
+			pcall(function() child:Destroy() end)
+		end
+	end
+
+	cinematicEffects = {Bloom = nil, DepthOfField = nil, Blur = nil, ColorCorrection = nil, SunRays = nil, Atmosphere = nil}
+end
+
+-- ─── Overlay & Panel Pengaturan GUI Pro (Anti-Shift Screen) ───────────────────
+
+local Overlay = Instance.new("ScreenGui")
+Overlay.Name              = "FreeCamOverlay"
+Overlay.ResetOnSpawn      = false
+Overlay.ZIndexBehavior    = Enum.ZIndexBehavior.Sibling
+Overlay.DisplayOrder      = 999
+Overlay.IgnoreGuiInset    = true
+Overlay.Parent            = LocalPlayer.PlayerGui
+Overlay.Enabled           = true
+
+local THEME = {
+	BG     = Color3.fromRGB(15, 15, 15),
+	FG     = Color3.fromRGB(240, 240, 240),
+	ACCENT = Color3.fromRGB(255, 140, 60),
+	PANEL  = Color3.fromRGB(20, 20, 24),
+	ALPHA  = 0.60,
+}
+
+local function addCorner(parent, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius or 8)
+	c.Parent = parent
+end
+
+local function addStroke(parent, color)
+	local s = Instance.new("UIStroke")
+	s.Color        = color or THEME.ACCENT
+	s.Thickness    = 1.5
+	s.Transparency = 0.35
+	s.Parent = parent
+end
+
+-- Tombol Trigger FreeCam (Agak Bawah Tengah)
+local FreeCamBtn = Instance.new("TextButton")
+FreeCamBtn.Size                = UDim2.new(0, 120, 0, 40)
+FreeCamBtn.AnchorPoint         = Vector2.new(0.5, 1)
+FreeCamBtn.Position            = UDim2.new(0.5, 0, 1, -80)
+FreeCamBtn.BackgroundColor3    = THEME.BG
+FreeCamBtn.BackgroundTransparency = 0.2
+FreeCamBtn.BorderSizePixel     = 0
+FreeCamBtn.Text                = "📷 Freecam"
+FreeCamBtn.TextColor3          = THEME.FG
+FreeCamBtn.TextSize            = 14
+FreeCamBtn.Font                = Enum.Font.MontserratBold
+FreeCamBtn.ZIndex              = 10
+FreeCamBtn.Parent              = Overlay
+addCorner(FreeCamBtn, 100)
+addStroke(FreeCamBtn, THEME.ACCENT)
+
+-- Tombol EXIT
+local ExitBtn = Instance.new("TextButton")
+ExitBtn.Size                = UDim2.new(0, 80, 0, 38)
+ExitBtn.Position            = UDim2.new(1, -96, 0, 16)
+ExitBtn.BackgroundColor3    = THEME.BG
+ExitBtn.BackgroundTransparency = 0.2
+ExitBtn.BorderSizePixel     = 0
+ExitBtn.Text                = "X  Exit"
+ExitBtn.TextColor3          = THEME.FG
+ExitBtn.TextSize            = 14
+ExitBtn.Font                = Enum.Font.Montserrat
+ExitBtn.ZIndex              = 10
+ExitBtn.Visible             = false
+ExitBtn.Parent              = Overlay
+addCorner(ExitBtn, 100)
+addStroke(ExitBtn, Color3.fromRGB(255, 80, 80))
+
+-- Tombol Toggle UI (Mata)
+local EyeBtn = Instance.new("TextButton")
+EyeBtn.Size                = UDim2.new(0, 45, 0, 38)
+EyeBtn.Position            = UDim2.new(1, -150, 0, 16)
+EyeBtn.BackgroundColor3    = THEME.BG
+EyeBtn.BackgroundTransparency = 0.2
+EyeBtn.BorderSizePixel     = 0
+EyeBtn.Text                = "👁"
+EyeBtn.TextColor3          = THEME.FG
+EyeBtn.TextSize            = 18
+EyeBtn.Font                = Enum.Font.Montserrat
+EyeBtn.ZIndex              = 10
+EyeBtn.Visible             = false
+EyeBtn.Parent              = Overlay
+addCorner(EyeBtn, 100)
+addStroke(EyeBtn, THEME.ACCENT)
+
+-- Tombol Buka Panel Lighting (Gear/Effects)
+local SettingsBtn = Instance.new("TextButton")
+SettingsBtn.Size                = UDim2.new(0, 45, 0, 38)
+SettingsBtn.Position            = UDim2.new(1, -204, 0, 16)
+SettingsBtn.BackgroundColor3    = THEME.BG
+SettingsBtn.BackgroundTransparency = 0.2
+SettingsBtn.BorderSizePixel     = 0
+SettingsBtn.Text                = "⚙"
+SettingsBtn.TextColor3          = THEME.FG
+SettingsBtn.TextSize            = 18
+SettingsBtn.Font                = Enum.Font.Montserrat
+SettingsBtn.ZIndex              = 10
+SettingsBtn.Visible             = false
+SettingsBtn.Parent              = Overlay
+addCorner(SettingsBtn, 100)
+addStroke(SettingsBtn, THEME.ACCENT)
+
+-- ── Panel Kontrol Lighting Cinematic (UI Pro) ────────────────────────────────
+
+local LightingPanel = Instance.new("Frame")
+LightingPanel.Size                = UDim2.new(0, 300, 0, 380)
+LightingPanel.Position            = UDim2.new(1, -310, 0, 64)
+LightingPanel.BackgroundColor3    = THEME.PANEL
+LightingPanel.BackgroundTransparency = 0.05
+LightingPanel.BorderSizePixel     = 0
+LightingPanel.Visible             = false
+LightingPanel.ZIndex              = 15
+LightingPanel.Parent              = Overlay
+addCorner(LightingPanel, 12)
+addStroke(LightingPanel, THEME.ACCENT)
+
+local PanelTitle = Instance.new("TextLabel")
+PanelTitle.Size                = UDim2.new(1, 0, 0, 40)
+PanelTitle.BackgroundTransparency = 1
+PanelTitle.Text                = "✨ Cinematic Lighting Pro"
+PanelTitle.TextColor3          = THEME.FG
+PanelTitle.TextSize            = 15
+PanelTitle.Font                = Enum.Font.MontserratBold
+PanelTitle.ZIndex              = 16
+PanelTitle.Parent              = LightingPanel
+
+local ScrollingOptions = Instance.new("ScrollingFrame")
+ScrollingOptions.Size                = UDim2.new(1, -16, 1, -50)
+ScrollingOptions.Position            = UDim2.new(0, 8, 0, 45)
+ScrollingOptions.BackgroundTransparency = 1
+ScrollingOptions.BorderSizePixel     = 0
+ScrollingOptions.CanvasSize          = UDim2.new(0, 0, 0, 460)
+ScrollingOptions.ScrollBarThickness  = 4
+ScrollingOptions.ZIndex              = 16
+ScrollingOptions.Parent              = LightingPanel
+
+local UIList = Instance.new("UIListLayout")
+UIList.SortOrder = Enum.SortOrder.LayoutOrder
+UIList.Padding = UDim.new(0, 12)
+UIList.Parent = ScrollingOptions
+
+local function createSliderRow(name, min, max, default, callback)
+	local container = Instance.new("Frame")
+	container.Size = UDim2.new(1, 0, 0, 48)
+	container.BackgroundTransparency = 1
+	container.ZIndex = 16
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, 0, 0, 20)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = name .. ": " .. tostring(default)
+	lbl.TextColor3 = THEME.FG
+	lbl.TextSize = 13
+	lbl.Font = Enum.Font.Montserrat
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.ZIndex = 16
+	lbl.Parent = container
+
+	local sliderBg = Instance.new("TextButton")
+	sliderBg.Size = UDim2.new(1, 0, 0, 18)
+	sliderBg.Position = UDim2.new(0, 0, 0, 24)
+	sliderBg.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+	sliderBg.BorderSizePixel = 0
+	sliderBg.Text = ""
+	sliderBg.ZIndex = 16
+	sliderBg.Parent = container
+	addCorner(sliderBg, 6)
+
+	local fill = Instance.new("Frame")
+	local initScale = math.clamp((default - min) / (max - min), 0, 1)
+	fill.Size = UDim2.new(initScale, 0, 1, 0)
+	fill.BackgroundColor3 = THEME.ACCENT
+	fill.BorderSizePixel = 0
+	fill.ZIndex = 16
+	fill.Parent = sliderBg
+	addCorner(fill, 6)
+
+	local dragging = false
+	sliderBg.InputBegan:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+		end
+	end)
+
+	UserInputService.InputEnded:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(inp)
+		if dragging and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+			local pos = inp.Position.X
+			local absPos = sliderBg.AbsolutePosition.X
+			local absSize = sliderBg.AbsoluteSize.X
+			if absSize > 0 then
+				local alpha = math.clamp((pos - absPos) / absSize, 0, 1)
+				fill.Size = UDim2.new(alpha, 0, 1, 0)
+				local val = min + (max - min) * alpha
+				val = math.floor(val * 100 + 0.5) / 100
+				lbl.Text = name .. ": " .. tostring(val)
+				callback(val)
+			end
+		end
+	end)
+
+	container.Parent = ScrollingOptions
+end
+
+local function createToggleRow(name, default, callback)
+	local container = Instance.new("Frame")
+	container.Size = UDim2.new(1, 0, 0, 32)
+	container.BackgroundTransparency = 1
+	container.ZIndex = 16
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(0.7, 0, 1, 0)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = name
+	lbl.TextColor3 = THEME.FG
+	lbl.TextSize = 13
+	lbl.Font = Enum.Font.Montserrat
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.ZIndex = 16
+	lbl.Parent = container
+
+	local togBtn = Instance.new("TextButton")
+	togBtn.Size = UDim2.new(0, 46, 0, 24)
+	togBtn.AnchorPoint = Vector2.new(1, 0.5)
+	togBtn.Position = UDim2.new(1, 0, 0.5, 0)
+	togBtn.BackgroundColor3 = default and THEME.ACCENT or Color3.fromRGB(45, 45, 50)
+	togBtn.BorderSizePixel = 0
+	togBtn.Text = default and "ON" or "OFF"
+	togBtn.TextColor3 = THEME.FG
+	togBtn.TextSize = 11
+	togBtn.Font = Enum.Font.MontserratBold
+	togBtn.ZIndex = 16
+	togBtn.Parent = container
+	addCorner(togBtn, 6)
+
+	local state = default
+	togBtn.MouseButton1Click:Connect(function()
+		state = not state
+		togBtn.BackgroundColor3 = state and THEME.ACCENT or Color3.fromRGB(45, 45, 50)
+		togBtn.Text = state and "ON" or "OFF"
+		callback(state)
+	end)
+
+	container.Parent = ScrollingOptions
+end
+
+createSliderRow("Brightness", 0, 10, 2.5, function(v) Lighting.Brightness = v end)
+createSliderRow("ClockTime (Pencahayaan)", 0, 24, 17.5, function(v) Lighting.ClockTime = v end)
+createSliderRow("Blur Realistic", 0, 30, 0, function(v) if cinematicEffects.Blur then cinematicEffects.Blur.Size = v end end)
+createToggleRow("Depth of Field (DoF)", false, function(state) if cinematicEffects.DepthOfField then cinematicEffects.DepthOfField.Enabled = state end end)
+createSliderRow("Focus Distance", 5, 500, 100, function(v) if cinematicEffects.DepthOfField then cinematicEffects.DepthOfField.FocusDistance = v end end)
+createSliderRow("Bloom Intensity", 0, 3, 0.8, function(v) if cinematicEffects.Bloom then cinematicEffects.Bloom.Intensity = v end end)
+createSliderRow("SunRays Intensity", 0, 1, 0.3, function(v) if cinematicEffects.SunRays then cinematicEffects.SunRays.Intensity = v end end)
+createSliderRow("Atmosphere Density", 0, 1, 0.25, function(v) if cinematicEffects.Atmosphere then cinematicEffects.Atmosphere.Density = v end end)
+createSliderRow("Contrast (Sinematik)", -1, 1, 0.2, function(v) if cinematicEffects.ColorCorrection then cinematicEffects.ColorCorrection.Contrast = v end end)
+createSliderRow("Saturation", -1, 1, 0.15, function(v) if cinematicEffects.ColorCorrection then cinematicEffects.ColorCorrection.Saturation = v end end)
+
+SettingsBtn.MouseButton1Click:Connect(function()
+	MenuOpen = not MenuOpen
+	LightingPanel.Visible = MenuOpen
+end)
+
+local DPad = Instance.new("Frame")
+DPad.Size                  = UDim2.new(0, 190, 0, 190)
+DPad.Position              = UDim2.new(0, 16, 1, -210)
+DPad.BackgroundTransparency = 1
+DPad.ZIndex                = 10
+DPad.Visible               = false
+DPad.Parent                = Overlay
+
+local VertFrame = Instance.new("Frame")
+VertFrame.Size             = UDim2.new(0, 68, 0, 144)
+VertFrame.Position         = UDim2.new(1, -94, 1, -165)
+VertFrame.BackgroundTransparency = 1
+VertFrame.ZIndex           = 10
+VertFrame.Visible          = false
+VertFrame.Parent           = Overlay
+
+local TiltFrame = Instance.new("Frame")
+TiltFrame.Size             = UDim2.new(0, 68, 0, 144)
+TiltFrame.Position         = UDim2.new(1, -170, 1, -165)
+TiltFrame.BackgroundTransparency = 1
+TiltFrame.ZIndex           = 10
+TiltFrame.Visible          = false
+TiltFrame.Parent           = Overlay
+
+local ZoomFrame = Instance.new("Frame")
+ZoomFrame.Size             = UDim2.new(0, 68, 0, 144)
+ZoomFrame.Position         = UDim2.new(1, -246, 1, -165)
+ZoomFrame.BackgroundTransparency = 1
+ZoomFrame.ZIndex           = 10
+ZoomFrame.Visible          = false
+ZoomFrame.Parent           = Overlay
+
+local function isMobileDevice()
+	if SCALE_MODE == "Mobile" then return true end
+	if SCALE_MODE == "PC" then return false end
+	return UserInputService.TouchEnabled
+end
+
+local function toggleUIElements()
+	UIHidden = not UIHidden
+	local showControls = not UIHidden and isMobileDevice()
+	DPad.Visible        = showControls
+	VertFrame.Visible   = showControls
+	TiltFrame.Visible   = showControls
+	ZoomFrame.Visible   = showControls
+	ExitBtn.Visible     = not UIHidden
+	SettingsBtn.Visible = not UIHidden
+	if UIHidden then LightingPanel.Visible = false end
+	EyeBtn.Text         = UIHidden and "🕶" or "👁"
+end
+
+EyeBtn.MouseButton1Click:Connect(toggleUIElements)
+
+-- ── Mobile D-Pad & Control ────────────────────────────────────────────────────
+
+local function makeDirBtn(parent, text, ax, ay, w, h, onState)
+	local btn = Instance.new("TextButton")
+	btn.Size                 = UDim2.new(0, w, 0, h)
+	btn.Position             = UDim2.new(ax, 0, ay, 0)
+	btn.BackgroundColor3       = THEME.BG
+	btn.BackgroundTransparency = THEME.ALPHA
+	btn.BorderSizePixel        = 0
+	btn.Text                 = text
+	btn.TextColor3           = THEME.FG
+	btn.TextScaled           = true
+	btn.Font                 = Enum.Font.Montserrat
+	btn.ZIndex               = 10
+	btn.Parent               = parent
+	addCorner(btn, 8)
+	addStroke(btn)
+	btn.InputBegan:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+			onState(true)
+		end
+	end)
+	btn.InputEnded:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseButton1 then
+			onState(false)
+		end
+	end)
+	return btn
+end
+
+local function makeTiltBtn(parent, flipX, ax, ay, w, h, onState)
+	local btn = Instance.new("ImageButton")
+	btn.Size                 = UDim2.new(0, w, 0, h)
+	btn.Position             = UDim2.new(ax, 0, ay, 0)
+	btn.BackgroundColor3       = THEME.BG
+	btn.BackgroundTransparency = THEME.ALPHA
+	btn.BorderSizePixel        = 0
+	btn.ImageTransparency      = 1
+	btn.ZIndex               = 10
+	btn.Parent               = parent
+	addCorner(btn, 8)
+	addStroke(btn)
+
+	local lbl = Instance.new("ImageLabel")
+	lbl.AnchorPoint            = Vector2.new(0.5, 0.5)
+	lbl.Size                   = UDim2.new(1, 0, 1, 0)
+	lbl.Position               = UDim2.new(0.5, 0, 0.5, 0)
+	lbl.BackgroundTransparency = 1
+	lbl.Image                  = "rbxassetid://86617453295561"
+	lbl.ImageColor3            = THEME.ACCENT
+	lbl.ScaleType              = Enum.ScaleType.Fit
+	lbl.ZIndex                 = 11
+	lbl.Parent                 = btn
+
+	if flipX then lbl.Rotation = 180 end
+
+	btn.InputBegan:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseButton1 then onState(true) end
+	end)
+	btn.InputEnded:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.Touch or inp.UserInputType == Enum.UserInputType.MouseButton1 then onState(false) end
+	end)
+	return btn
+end
+
+makeDirBtn(DPad, "▲", 0.36, 0,   62, 62, function(s) MobileInput.Forward = s end)
+makeDirBtn(DPad, "▼", 0.36, 0.68, 62, 62, function(s) MobileInput.Back    = s end)
+makeDirBtn(DPad, "◄", 0,    0.36, 62, 62, function(s) MobileInput.Left    = s end)
+makeDirBtn(DPad, "►", 0.68, 0.36, 62, 62, function(s) MobileInput.Right   = s end)
+
+makeDirBtn(VertFrame, "↑", 0, 0,   68, 64, function(s) MobileInput.Up   = s end)
+makeDirBtn(VertFrame, "↓", 0, 0.56, 68, 64, function(s) MobileInput.Down = s end)
+
+makeTiltBtn(TiltFrame, false, 0, 0,   68, 64, function(s) MobileInput.TiltLeft  = s end)
+makeTiltBtn(TiltFrame, true,  0, 0.56, 68, 64, function(s) MobileInput.TiltRight = s end)
+
+makeDirBtn(ZoomFrame, "Zoom+", 0, 0,   68, 64, function(s) MobileInput.ZoomIn  = s end)
+makeDirBtn(ZoomFrame, "Zoom-", 0, 0.56, 68, 64, function(s) MobileInput.ZoomOut = s end)
+
+-- ─── FreeCam Part & Update Loop ──────────────────────────────────────────────
+
+local function createFreeCamPart()
+	local p = Instance.new("Part")
+	p.Name         = "FreeCamPart"
+	p.Size         = Vector3.new(0.1, 0.1, 0.1)
+	p.Anchored     = true
+	p.CanCollide   = false
+	p.Transparency = 1
+	p.CastShadow   = false
+	p.CFrame       = Camera.CFrame
+	p.Parent       = workspace
+	return p
+end
+
+local function setCharacterFrozen(frozen)
+	local char = LocalPlayer.Character
+	if not char then return end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hrp or not hum then return end
+
+	if frozen then
+		OriginalRootAnchored  = hrp.Anchored
+		OriginalRootCollision = hrp.CanCollide
+		hum.WalkSpeed         = 0
+		hum.JumpHeight        = 0
+		hrp.Anchored          = true
+		hrp.CanCollide        = false
+		hum.AutoRotate        = false
+	else
+		hum.WalkSpeed  = 16
+		hum.JumpHeight = 7.2
+		hrp.Anchored   = OriginalRootAnchored
+		hrp.CanCollide = OriginalRootCollision
+		hum.AutoRotate = true
+	end
+end
+
+local function initAngles(cf)
+	local lv = cf.LookVector
+	pitch = math.asin(math.clamp(lv.Y, -1, 1))
+	yaw   = math.atan2(-lv.X, -lv.Z)
+	roll  = 0
+	targetFov = Camera.FieldOfView
+	currentFov = Camera.FieldOfView
+	currentVelocity = Vector3.new(0, 0, 0)
+end
+
+local function getMovementVector()
+	local move = Vector3.zero
+	if not isMobileDevice() then
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += Vector3.new( 0, 0,-1) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then move += Vector3.new( 0, 0, 1) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then move += Vector3.new(-1, 0, 0) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += Vector3.new( 1, 0, 0) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.E) then move += Vector3.new( 0, 1, 0) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Q) then move += Vector3.new( 0,-1, 0) end
+	else
+		if MobileInput.Forward then move += Vector3.new( 0, 0,-1) end
+		if MobileInput.Back    then move += Vector3.new( 0, 0, 1) end
+		if MobileInput.Left    then move += Vector3.new(-1, 0, 0) end
+		if MobileInput.Right   then move += Vector3.new( 1, 0, 0) end
+		if MobileInput.Up      then move += Vector3.new( 0, 1, 0) end
+		if MobileInput.Down    then move += Vector3.new( 0,-1, 0) end
+	end
+	return move.Magnitude > 0 and move.Unit or move
+end
+
+local TILT_MAX_RAD   = math.rad(CONFIG.TiltMax)
+local TILT_SPEED_RAD = math.rad(CONFIG.TiltSpeed)
+
+local function freecamUpdate(dt)
+	if not FreeCamActive or not FreeCamPart then return end
+
+	if not isMobileDevice() then
+		if UserInputService:IsKeyDown(Enum.KeyCode.I) then
+			targetFov = math.clamp(targetFov - CONFIG.ZoomSpeed, CONFIG.MinFOV, CONFIG.MaxFOV)
+		elseif UserInputService:IsKeyDown(Enum.KeyCode.O) then
+			targetFov = math.clamp(targetFov + CONFIG.ZoomSpeed, CONFIG.MinFOV, CONFIG.MaxFOV)
+		end
+	else
+		if MobileInput.ZoomIn then
+			targetFov = math.clamp(targetFov - CONFIG.ZoomSpeed, CONFIG.MinFOV, CONFIG.MaxFOV)
+		elseif MobileInput.ZoomOut then
+			targetFov = math.clamp(targetFov + CONFIG.ZoomSpeed, CONFIG.MinFOV, CONFIG.MaxFOV)
+		end
+	end
+
+	currentFov = currentFov + (targetFov - currentFov) * (dt * 10)
+	Camera.FieldOfView = currentFov
+
+	local tiltLeft  = (not isMobileDevice() and UserInputService:IsKeyDown(Enum.KeyCode.Z)) or MobileInput.TiltLeft
+	local tiltRight = (not isMobileDevice() and UserInputService:IsKeyDown(Enum.KeyCode.C)) or MobileInput.TiltRight
+
+	if tiltLeft and not tiltRight then
+		roll = math.clamp(roll - TILT_SPEED_RAD * (dt / (1/60)), -TILT_MAX_RAD, TILT_MAX_RAD)
+	elseif tiltRight and not tiltLeft then
+		roll = math.clamp(roll + TILT_SPEED_RAD * (dt / (1/60)), -TILT_MAX_RAD, TILT_MAX_RAD)
+	end
+
+	local sprint = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+	local speed  = sprint and CONFIG.SprintSpeed or CONFIG.Speed
+	if isMobileDevice() then speed *= CONFIG.MobileSpeed end
+
+	local moveVec = getMovementVector()
+	local cf      = CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0)
+	local targetVelocity = cf:VectorToWorldSpace(moveVec) * speed
+
+	currentVelocity = currentVelocity:Lerp(targetVelocity, CONFIG.Smoothness)
+	FreeCamPart.CFrame = FreeCamPart.CFrame + (currentVelocity * dt)
+
+	Camera.CFrame = CFrame.new(FreeCamPart.Position)
+		* CFrame.Angles(0, yaw, 0)
+		* CFrame.Angles(pitch, 0, 0)
+		* CFrame.Angles(0, 0, roll)
+	Camera.CameraType = Enum.CameraType.Scriptable
+end
+
+-- ─── Activate / Deactivate ───────────────────────────────────────────────────
+
+local deactivateFreeCam
+
+local function activateFreeCam()
+	if FreeCamActive or IsTransitioning then return end
+	IsTransitioning = true
+	FreeCamActive   = true
+
+	initAngles(Camera.CFrame)
+	FreeCamPart = createFreeCamPart()
+
+	setCoreUI(false)
+	hideAllScreenGuis()
+	setOverheadsVisible(false)
+	setCharacterFrozen(true)
+	setupCinematicEffects()
+
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	RMBHeld = false
+
+	Camera.CameraType = Enum.CameraType.Scriptable
+
+	UIHidden = false
+	MenuOpen = false
+	LightingPanel.Visible = false
+	EyeBtn.Text = "👁"
+
+	FreeCamBtn.Visible  = false
+	ExitBtn.Visible     = true
+	EyeBtn.Visible      = true
+	SettingsBtn.Visible = true
+
+	local showControls = not UIHidden and isMobileDevice()
+	DPad.Visible      = showControls
+	VertFrame.Visible = showControls
+	TiltFrame.Visible = showControls
+	ZoomFrame.Visible = showControls
+
+	Connections.render = RunService.RenderStepped:Connect(freecamUpdate)
+
+	Connections.mouseWheel = UserInputService.InputChanged:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseWheel then
+			targetFov = math.clamp(targetFov - (inp.Position.Z * CONFIG.ZoomSpeed * 1.5), CONFIG.MinFOV, CONFIG.MaxFOV)
+		end
+	end)
+
+	Connections.inputBegan = UserInputService.InputBegan:Connect(function(inp, gp)
+		if gp then return end
+		if inp.UserInputType == Enum.UserInputType.MouseButton2 then
+			RMBHeld = true
+			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+		end
+		if inp.KeyCode == Enum.KeyCode.X then
+			deactivateFreeCam()
+		end
+	end)
+
+	Connections.inputEnded = UserInputService.InputEnded:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton2 then
+			RMBHeld = false
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		end
+	end)
+
+	Connections.mouseMoved = UserInputService.InputChanged:Connect(function(inp)
+		if not FreeCamActive then return end
+		if inp.UserInputType == Enum.UserInputType.MouseMovement and RMBHeld then
+			yaw   = yaw - inp.Delta.X * CONFIG.Sensitivity
+			pitch = math.clamp(
+				pitch - inp.Delta.Y * CONFIG.Sensitivity,
+				-math.pi/2 + 0.01, math.pi/2 - 0.01
+			)
+		end
+	end)
+
+	if isMobileDevice() then
+		Connections.touchBegan = UserInputService.TouchStarted:Connect(function(inp, gp)
+			if gp then return end
+			if MobileLookId == nil then
+				MobileLookId  = inp
+				MobileLastPos = inp.Position
+			end
+		end)
+		Connections.touchMoved = UserInputService.TouchMoved:Connect(function(inp, gp)
+			if gp then return end
+			if inp == MobileLookId and MobileLastPos then
+				local delta = inp.Position - MobileLastPos
+				MobileLastPos = inp.Position
+				yaw   = yaw - delta.X * CONFIG.Sensitivity
+				pitch = math.clamp(
+					pitch - delta.Y * CONFIG.Sensitivity,
+					-math.pi/2 + 0.01, math.pi/2 - 0.01
+				)
+			end
+		end)
+		Connections.touchEnded = UserInputService.TouchEnded:Connect(function(inp)
+			if inp == MobileLookId then
+				MobileLookId  = nil
+				MobileLastPos = nil
+			end
+		end)
+	end
+
+	IsTransitioning = false
+end
+
+deactivateFreeCam = function()
+	if not FreeCamActive or IsTransitioning then return end
+	IsTransitioning = true
+	FreeCamActive   = false
+
+	for k, c in pairs(Connections) do
+		if c then c:Disconnect() end
+		Connections[k] = nil
+	end
+
+	if FreeCamPart and FreeCamPart.Parent then FreeCamPart:Destroy() end
+	FreeCamPart = nil
+
+	RMBHeld = false
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+
+	MobileLookId  = nil
+	MobileLastPos = nil
+	for k in pairs(MobileInput) do MobileInput[k] = false end
+
+	roll = 0
+	Camera.FieldOfView = 70
+
+	FreeCamBtn.Visible    = true
+	ExitBtn.Visible       = false
+	EyeBtn.Visible        = false
+	SettingsBtn.Visible   = false
+	LightingPanel.Visible = false
+	MenuOpen              = false
+
+	DPad.Visible      = false
+	VertFrame.Visible = false
+	TiltFrame.Visible = false
+	ZoomFrame.Visible = false
+
+	removeCinematicEffects()
+	setCoreUI(true)
+	restoreAllScreenGuis()
+	setOverheadsVisible(true)
+	setCharacterFrozen(false)
+
+	Camera.CameraType = Enum.CameraType.Custom
+	local char = LocalPlayer.Character
+	if char then
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then Camera.CameraSubject = hum end
+	end
+
+	IsTransitioning = false
+end
+
+FreeCamBtn.MouseButton1Click:Connect(function()
+	if FreeCamActive then
+		deactivateFreeCam()
+	else
+		activateFreeCam()
+	end
+end)
+
+ExitBtn.MouseButton1Click:Connect(function()
+	if not FreeCamActive then return end
+	deactivateFreeCam()
+end)
+
+UserInputService.InputBegan:Connect(function(inp, gp)
+	if gp then return end
+	if inp.KeyCode == Enum.KeyCode.F2 then
+		if FreeCamActive then
+			deactivateFreeCam()
+		else
+			activateFreeCam()
+		end
+	end
+end)
+
+-- ─── Reset State Saat Character Added / Respawn ─────────────────────────────
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+	FreeCamActive   = false
+	IsTransitioning = false
+
+	for k, c in pairs(Connections) do
+		if c then c:Disconnect() end
+		Connections[k] = nil
+	end
+
+	if FreeCamPart and FreeCamPart.Parent then
+		FreeCamPart:Destroy()
+	end
+	FreeCamPart = nil
+
+	roll       = 0
+	pitch, yaw = 0, 0
+	RMBHeld    = false
+
+	FreeCamBtn.Visible    = true
+	ExitBtn.Visible       = false
+	EyeBtn.Visible        = false
+	SettingsBtn.Visible   = false
+	LightingPanel.Visible = false
+	DPad.Visible          = false
+	VertFrame.Visible     = false
+	TiltFrame.Visible     = false
+	ZoomFrame.Visible     = false
+
+	removeCinematicEffects()
+	setCoreUI(true)
+	restoreAllScreenGuis()
+	setOverheadsVisible(true)
+	UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+
+	Character  = char
+	HumanoidRP = char:WaitForChild("HumanoidRootPart")
+	Humanoid   = char:WaitForChild("Humanoid")
+
+	Camera.CameraType    = Enum.CameraType.Custom
+	Camera.CameraSubject = Humanoid
+end)
